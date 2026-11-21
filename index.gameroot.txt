@@ -1,0 +1,1157 @@
+// ============================================================================
+// PROJECT UNKNOWN - Phase 1 (single-file edition)
+//
+// SETUP: is file ko Assets/Scripts/GameRoot.cs naam se save karein. Bas.
+//  - Koi scene/GameObject banane ki zaroorat nahi: GameRoot Play dabate hi apne aap ban jata hai.
+//  - Console me dikhna chahiye: "[PU] GameRoot ready: 4 services initialised."
+//  - File ka naam GameRoot.cs hi rakhein (Unity rule: MonoBehaviour ka naam = file ka naam).
+//
+// Naye scripts me services aise use karein (Start() me, Awake() me nahi):
+//     var state = ProjectUnknown.Core.Services.ServiceLocator.Get<IGameStateService>();
+// ============================================================================
+using System.Collections.Generic;
+using System.Collections;
+using System;
+using ProjectUnknown.Core.Events;
+using ProjectUnknown.Core.Logging;
+using ProjectUnknown.Core.Services;
+using ProjectUnknown.Core.Settings;
+using ProjectUnknown.Core.State;
+using UnityEngine.Pool;
+using UnityEngine.SceneManagement;
+using UnityEngine;
+
+// ====================================================================
+// Core/Logging/GameLog
+// ====================================================================
+namespace ProjectUnknown.Core.Logging
+{
+    /// <summary>
+    /// Thin logging facade.
+    /// <see cref="Info"/> is compiled out of release builds (the [Conditional] attribute also
+    /// skips evaluating the arguments, so string building costs nothing in release).
+    /// Warnings and errors are always emitted.
+    /// NOTE: UnityEngine.Debug is fully qualified on purpose, it is ambiguous with
+    /// System.Diagnostics.Debug in files that import both namespaces.
+    /// </summary>
+    public static class GameLog
+    {
+        private const string Tag = "[PU] ";
+
+        [System.Diagnostics.Conditional("UNITY_EDITOR")]
+        [System.Diagnostics.Conditional("DEVELOPMENT_BUILD")]
+        public static void Info(string message, UnityEngine.Object context = null)
+        {
+            UnityEngine.Debug.Log(Tag + message, context);
+        }
+
+        public static void Warning(string message, UnityEngine.Object context = null)
+        {
+            UnityEngine.Debug.LogWarning(Tag + message, context);
+        }
+
+        public static void Error(string message, UnityEngine.Object context = null)
+        {
+            UnityEngine.Debug.LogError(Tag + message, context);
+        }
+    }
+}
+
+// ====================================================================
+// Core/Events/IGameEvent
+// ====================================================================
+namespace ProjectUnknown.Core.Events
+{
+    /// <summary>
+    /// Marker for every event that travels over the <see cref="IEventBus"/>.
+    /// Implementations MUST be (readonly) structs so publishing never allocates.
+    /// </summary>
+    public interface IGameEvent
+    {
+    }
+}
+
+// ====================================================================
+// Core/Events/IEventBus
+// ====================================================================
+namespace ProjectUnknown.Core.Events
+{
+    /// <summary>
+    /// Decoupled, typed publish/subscribe channel. Gameplay modules talk to each other
+    /// through events instead of referencing each other directly.
+    /// Main-thread only.
+    /// </summary>
+    public interface IEventBus
+    {
+        /// <summary>Registers a handler. Subscribing the same handler twice has no effect.</summary>
+        void Subscribe<T>(Action<T> handler) where T : struct, IGameEvent;
+
+        /// <summary>Removes a handler. Removing a handler that is not registered is a no-op.</summary>
+        void Unsubscribe<T>(Action<T> handler) where T : struct, IGameEvent;
+
+        /// <summary>
+        /// Delivers the event to all handlers registered at the moment of the call.
+        /// A throwing handler is logged and does not prevent the others from running.
+        /// </summary>
+        void Publish<T>(in T gameEvent) where T : struct, IGameEvent;
+    }
+}
+
+// ====================================================================
+// Core/Events/EventBus
+// ====================================================================
+namespace ProjectUnknown.Core.Events
+{
+    /// <summary>
+    /// Default <see cref="IEventBus"/>.
+    /// Design: copy-on-write handler arrays. Subscribe/Unsubscribe allocate (rare, usually at
+    /// startup or enable/disable); Publish iterates an immutable snapshot and allocates nothing,
+    /// and handlers may safely (un)subscribe while an event is being delivered.
+    /// </summary>
+    public sealed class EventBus : IEventBus
+    {
+        private interface IHandlerList
+        {
+        }
+
+        private sealed class HandlerList<T> : IHandlerList where T : struct, IGameEvent
+        {
+            public Action<T>[] Handlers = Array.Empty<Action<T>>();
+        }
+
+        private readonly Dictionary<Type, IHandlerList> _lists = new Dictionary<Type, IHandlerList>();
+
+        public void Subscribe<T>(Action<T> handler) where T : struct, IGameEvent
+        {
+            if (handler == null)
+            {
+                throw new ArgumentNullException(nameof(handler));
+            }
+
+            HandlerList<T> list = GetOrCreate<T>();
+            if (Array.IndexOf(list.Handlers, handler) >= 0)
+            {
+                return;
+            }
+
+            var next = new Action<T>[list.Handlers.Length + 1];
+            Array.Copy(list.Handlers, next, list.Handlers.Length);
+            next[next.Length - 1] = handler;
+            list.Handlers = next;
+        }
+
+        public void Unsubscribe<T>(Action<T> handler) where T : struct, IGameEvent
+        {
+            if (handler == null || !_lists.TryGetValue(typeof(T), out IHandlerList raw))
+            {
+                return;
+            }
+
+            var list = (HandlerList<T>)raw;
+            int index = Array.IndexOf(list.Handlers, handler);
+            if (index < 0)
+            {
+                return;
+            }
+
+            if (list.Handlers.Length == 1)
+            {
+                list.Handlers = Array.Empty<Action<T>>();
+                return;
+            }
+
+            var next = new Action<T>[list.Handlers.Length - 1];
+            Array.Copy(list.Handlers, 0, next, 0, index);
+            Array.Copy(list.Handlers, index + 1, next, index, list.Handlers.Length - index - 1);
+            list.Handlers = next;
+        }
+
+        public void Publish<T>(in T gameEvent) where T : struct, IGameEvent
+        {
+            if (!_lists.TryGetValue(typeof(T), out IHandlerList raw))
+            {
+                return;
+            }
+
+            Action<T>[] snapshot = ((HandlerList<T>)raw).Handlers;
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                try
+                {
+                    snapshot[i](gameEvent);
+                }
+                catch (Exception ex)
+                {
+                    GameLog.Error($"EventBus: a handler for {typeof(T).Name} threw: {ex}");
+                }
+            }
+        }
+
+        /// <summary>Drops every subscription. Used on teardown.</summary>
+        public void Clear()
+        {
+            _lists.Clear();
+        }
+
+        private HandlerList<T> GetOrCreate<T>() where T : struct, IGameEvent
+        {
+            if (_lists.TryGetValue(typeof(T), out IHandlerList raw))
+            {
+                return (HandlerList<T>)raw;
+            }
+
+            var created = new HandlerList<T>();
+            _lists.Add(typeof(T), created);
+            return created;
+        }
+    }
+}
+
+// ====================================================================
+// Core/Events/SystemEvents
+// ====================================================================
+namespace ProjectUnknown.Core.Events
+{
+    // Engine/system level events. Gameplay events (item collected, quest completed, ...)
+    // are added in the phase that introduces them, in this same assembly, so that modules can
+    // communicate without referencing each other.
+
+    /// <summary>The global game state changed.</summary>
+    public readonly struct GameStateChangedEvent : IGameEvent
+    {
+        public readonly GameState Previous;
+        public readonly GameState Current;
+
+        public GameStateChangedEvent(GameState previous, GameState current)
+        {
+            Previous = previous;
+            Current = current;
+        }
+    }
+
+    /// <summary>
+    /// The app went to / came back from the background. On Android this is the ONLY reliable
+    /// moment to persist data (OnApplicationQuit is not guaranteed to run).
+    /// </summary>
+    public readonly struct ApplicationPausedEvent : IGameEvent
+    {
+        public readonly bool IsPaused;
+
+        public ApplicationPausedEvent(bool isPaused)
+        {
+            IsPaused = isPaused;
+        }
+    }
+
+    /// <summary>The application is quitting (best effort on mobile).</summary>
+    public readonly struct ApplicationQuittingEvent : IGameEvent
+    {
+    }
+
+    public readonly struct SceneLoadStartedEvent : IGameEvent
+    {
+        public readonly string SceneName;
+
+        public SceneLoadStartedEvent(string sceneName)
+        {
+            SceneName = sceneName;
+        }
+    }
+
+    public readonly struct SceneLoadProgressEvent : IGameEvent
+    {
+        public readonly string SceneName;
+
+        /// <summary>Normalised 0..1.</summary>
+        public readonly float Progress;
+
+        public SceneLoadProgressEvent(string sceneName, float progress)
+        {
+            SceneName = sceneName;
+            Progress = progress;
+        }
+    }
+
+    public readonly struct SceneLoadCompletedEvent : IGameEvent
+    {
+        public readonly string SceneName;
+
+        public SceneLoadCompletedEvent(string sceneName)
+        {
+            SceneName = sceneName;
+        }
+    }
+
+    public readonly struct QualityChangedEvent : IGameEvent
+    {
+        public readonly GraphicsQuality Previous;
+        public readonly GraphicsQuality Current;
+
+        public QualityChangedEvent(GraphicsQuality previous, GraphicsQuality current)
+        {
+            Previous = previous;
+            Current = current;
+        }
+    }
+}
+
+// ====================================================================
+// Core/State/GameState
+// ====================================================================
+namespace ProjectUnknown.Core.State
+{
+    /// <summary>Global application/game state.</summary>
+    public enum GameState
+    {
+        Boot = 0,
+        MainMenu = 1,
+        Loading = 2,
+        Playing = 3,
+        Paused = 4,
+        GameOver = 5
+    }
+}
+
+// ====================================================================
+// Core/State/GameStateTransitions
+// ====================================================================
+namespace ProjectUnknown.Core.State
+{
+    /// <summary>
+    /// Pure rule table describing which state changes are legal.
+    /// Kept free of side effects so it is trivially unit-testable.
+    /// </summary>
+    public static class GameStateTransitions
+    {
+        public static bool IsAllowed(GameState from, GameState to)
+        {
+            if (from == to)
+            {
+                return false;
+            }
+
+            switch (from)
+            {
+                case GameState.Boot:
+                    // Boot -> Playing exists so a gameplay scene can be started directly in the Editor.
+                    return to == GameState.MainMenu || to == GameState.Loading || to == GameState.Playing;
+
+                case GameState.MainMenu:
+                    return to == GameState.Loading;
+
+                case GameState.Loading:
+                    return to == GameState.Playing || to == GameState.MainMenu;
+
+                case GameState.Playing:
+                    return to == GameState.Paused || to == GameState.GameOver
+                        || to == GameState.Loading || to == GameState.MainMenu;
+
+                case GameState.Paused:
+                    return to == GameState.Playing || to == GameState.Loading || to == GameState.MainMenu;
+
+                case GameState.GameOver:
+                    return to == GameState.MainMenu || to == GameState.Loading;
+
+                default:
+                    return false;
+            }
+        }
+    }
+}
+
+// ====================================================================
+// Core/Settings/GraphicsQuality
+// ====================================================================
+namespace ProjectUnknown.Core.Settings
+{
+    /// <summary>User-facing graphics presets. Numeric order matters (higher = heavier).</summary>
+    public enum GraphicsQuality
+    {
+        Low = 0,
+        Medium = 1,
+        High = 2
+    }
+}
+
+// ====================================================================
+// Core/Settings/QualityProfile
+// ====================================================================
+namespace ProjectUnknown.Core.Settings
+{
+    /// <summary>
+    /// Engine-agnostic description of one graphics preset. Only values that Phase 1 actually
+    /// applies live here; URP asset level settings (render scale, shadows, ...) are added in Phase 7
+    /// when the per-tier URP assets exist.
+    /// </summary>
+    public readonly struct QualityProfile
+    {
+        public readonly int TargetFrameRate;
+        public readonly float LodBias;
+
+        /// <summary>0 = full resolution textures, 1 = half, 2 = quarter.</summary>
+        public readonly int TextureMipmapLimit;
+
+        public readonly bool UseAnisotropicFiltering;
+
+        public QualityProfile(int targetFrameRate, float lodBias, int textureMipmapLimit, bool useAnisotropicFiltering)
+        {
+            TargetFrameRate = targetFrameRate;
+            LodBias = lodBias;
+            TextureMipmapLimit = textureMipmapLimit;
+            UseAnisotropicFiltering = useAnisotropicFiltering;
+        }
+    }
+}
+
+// ====================================================================
+// Core/Settings/QualityProfiles
+// ====================================================================
+namespace ProjectUnknown.Core.Settings
+{
+    /// <summary>
+    /// Preset table and first-launch device heuristic.
+    /// The numbers are conservative starting points, NOT measured values: they must be tuned
+    /// with on-device profiling in Phase 7.
+    /// </summary>
+    public static class QualityProfiles
+    {
+        private static readonly QualityProfile LowProfile = new QualityProfile(30, 0.7f, 1, false);
+        private static readonly QualityProfile MediumProfile = new QualityProfile(30, 1.0f, 0, false);
+        private static readonly QualityProfile HighProfile = new QualityProfile(60, 1.25f, 0, true);
+
+        public static QualityProfile For(GraphicsQuality quality)
+        {
+            switch (quality)
+            {
+                case GraphicsQuality.Low: return LowProfile;
+                case GraphicsQuality.Medium: return MediumProfile;
+                case GraphicsQuality.High: return HighProfile;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(quality), quality, "Unknown graphics quality.");
+            }
+        }
+
+        /// <summary>
+        /// Picks a first-launch preset from RAM and CPU core count.
+        /// Android reports slightly less than the marketed RAM (a "4 GB" phone reports ~3.6 GB),
+        /// hence the non-round thresholds. Unknown hardware (memory &lt;= 0) falls back to Low.
+        /// </summary>
+        public static GraphicsQuality Recommend(int systemMemoryMb, int processorCount)
+        {
+            if (systemMemoryMb <= 0)
+            {
+                return GraphicsQuality.Low;
+            }
+
+            GraphicsQuality tier;
+            if (systemMemoryMb < 3500)
+            {
+                tier = GraphicsQuality.Low;
+            }
+            else if (systemMemoryMb < 6500)
+            {
+                tier = GraphicsQuality.Medium;
+            }
+            else
+            {
+                tier = GraphicsQuality.High;
+            }
+
+            // Few cores usually means a slow SoC regardless of RAM: step down one tier.
+            if (processorCount < 6 && tier > GraphicsQuality.Low)
+            {
+                tier = (GraphicsQuality)((int)tier - 1);
+            }
+
+            return tier;
+        }
+    }
+}
+
+// ====================================================================
+// Core/Services/IGameService
+// ====================================================================
+namespace ProjectUnknown.Core.Services
+{
+    /// <summary>
+    /// Lifecycle contract for services owned by the composition root (GameRoot).
+    /// Initialize is called in registration order, Shutdown in reverse order.
+    /// </summary>
+    public interface IGameService
+    {
+        void Initialize();
+
+        void Shutdown();
+    }
+}
+
+// ====================================================================
+// Core/Services/IGameStateService
+// ====================================================================
+namespace ProjectUnknown.Core.Services
+{
+    public interface IGameStateService
+    {
+        GameState Current { get; }
+
+        GameState Previous { get; }
+
+        /// <summary>Returns false (and changes nothing) if the transition is not allowed.</summary>
+        bool TryChangeState(GameState next);
+    }
+}
+
+// ====================================================================
+// Core/Services/ISceneService
+// ====================================================================
+namespace ProjectUnknown.Core.Services
+{
+    public interface ISceneService
+    {
+        bool IsLoading { get; }
+
+        /// <summary>
+        /// Starts loading a scene (single mode). Returns false if the name is invalid, the scene is
+        /// not in the build settings, or another load is already running.
+        /// Progress is reported through SceneLoad*Event on the event bus.
+        /// </summary>
+        bool LoadScene(string sceneName);
+    }
+}
+
+// ====================================================================
+// Core/Services/IQualityService
+// ====================================================================
+namespace ProjectUnknown.Core.Services
+{
+    public interface IQualityService
+    {
+        GraphicsQuality Current { get; }
+
+        void SetQuality(GraphicsQuality quality);
+    }
+}
+
+// ====================================================================
+// Core/Services/ServiceLocator
+// ====================================================================
+namespace ProjectUnknown.Core.Services
+{
+    /// <summary>
+    /// Minimal service registry. Services are registered against an interface by the composition
+    /// root and resolved by consumers. Main-thread only.
+    /// Rules: register once (duplicates throw, they indicate a composition bug), resolve in Start or
+    /// later (not in Awake of scene objects) and cache the result.
+    /// </summary>
+    public static class ServiceLocator
+    {
+        private static readonly Dictionary<Type, object> Services = new Dictionary<Type, object>();
+
+        public static void Register<T>(T service) where T : class
+        {
+            if (service == null)
+            {
+                throw new ArgumentNullException(nameof(service));
+            }
+
+            Type key = typeof(T);
+            if (Services.ContainsKey(key))
+            {
+                throw new InvalidOperationException($"Service {key.Name} is already registered.");
+            }
+
+            Services.Add(key, service);
+        }
+
+        public static bool Unregister<T>() where T : class
+        {
+            return Services.Remove(typeof(T));
+        }
+
+        public static T Get<T>() where T : class
+        {
+            if (Services.TryGetValue(typeof(T), out object service))
+            {
+                return (T)service;
+            }
+
+            throw new InvalidOperationException(
+                $"Service {typeof(T).Name} is not registered. Is GameRoot initialised yet?");
+        }
+
+        public static bool TryGet<T>(out T service) where T : class
+        {
+            if (Services.TryGetValue(typeof(T), out object found))
+            {
+                service = (T)found;
+                return true;
+            }
+
+            service = null;
+            return false;
+        }
+
+        public static bool IsRegistered<T>() where T : class
+        {
+            return Services.ContainsKey(typeof(T));
+        }
+
+        public static void Clear()
+        {
+            Services.Clear();
+        }
+    }
+}
+
+// ====================================================================
+// Core/Pooling/PrefabPool
+// ====================================================================
+namespace ProjectUnknown.Core.Pooling
+{
+    /// <summary>
+    /// Component pool for prefabs (projectiles, pickups, VFX, floating damage numbers, ...),
+    /// built on UnityEngine.Pool.ObjectPool. Avoids Instantiate/Destroy churn and GC spikes on mobile.
+    /// Usage: create once per prefab, call Get/Release, call Clear when the owner is destroyed.
+    /// </summary>
+    public sealed class PrefabPool<T> where T : Component
+    {
+        private readonly T _prefab;
+        private readonly Transform _root;
+        private readonly ObjectPool<T> _pool;
+
+        /// <param name="prefab">Prefab to instantiate.</param>
+        /// <param name="root">Parent for pooled (inactive) instances; keeps the hierarchy tidy.</param>
+        /// <param name="defaultCapacity">Initial capacity of the internal stack.</param>
+        /// <param name="maxSize">Instances beyond this count are destroyed on release instead of kept.</param>
+        public PrefabPool(T prefab, Transform root = null, int defaultCapacity = 16, int maxSize = 128)
+        {
+            if (prefab == null)
+            {
+                throw new ArgumentNullException(nameof(prefab));
+            }
+
+            if (defaultCapacity < 0 || maxSize < 1 || defaultCapacity > maxSize)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxSize), "Require 0 <= defaultCapacity <= maxSize and maxSize >= 1.");
+            }
+
+            _prefab = prefab;
+            _root = root;
+
+#if UNITY_EDITOR
+            const bool collectionCheck = true; // catches double-release bugs while developing
+#else
+            const bool collectionCheck = false;
+#endif
+            _pool = new ObjectPool<T>(
+                CreateInstance, OnGet, OnRelease, OnDestroyInstance,
+                collectionCheck, defaultCapacity, maxSize);
+        }
+
+        public int CountInactive => _pool.CountInactive;
+
+        public T Get()
+        {
+            return _pool.Get();
+        }
+
+        public T Get(Vector3 position, Quaternion rotation)
+        {
+            T instance = _pool.Get();
+            instance.transform.SetPositionAndRotation(position, rotation);
+            return instance;
+        }
+
+        public void Release(T instance)
+        {
+            if (instance == null)
+            {
+                return; // already destroyed (e.g. scene unload); nothing to return
+            }
+
+            _pool.Release(instance);
+        }
+
+        /// <summary>Pre-creates instances so the first gameplay use does not hitch.</summary>
+        public void Prewarm(int count)
+        {
+            if (count <= 0)
+            {
+                return;
+            }
+
+            var temp = new List<T>(count);
+            for (int i = 0; i < count; i++)
+            {
+                temp.Add(_pool.Get());
+            }
+
+            for (int i = 0; i < temp.Count; i++)
+            {
+                _pool.Release(temp[i]);
+            }
+        }
+
+        /// <summary>Destroys all inactive instances.</summary>
+        public void Clear()
+        {
+            _pool.Clear();
+        }
+
+        private T CreateInstance()
+        {
+            T instance = UnityEngine.Object.Instantiate(_prefab, _root);
+            instance.gameObject.SetActive(false);
+            return instance;
+        }
+
+        private static void OnGet(T instance)
+        {
+            instance.gameObject.SetActive(true);
+        }
+
+        private static void OnRelease(T instance)
+        {
+            instance.gameObject.SetActive(false);
+        }
+
+        private static void OnDestroyInstance(T instance)
+        {
+            if (instance != null)
+            {
+                UnityEngine.Object.Destroy(instance.gameObject);
+            }
+        }
+    }
+}
+
+// ====================================================================
+// Managers/GameStateManager
+// ====================================================================
+namespace ProjectUnknown.Managers
+{
+    /// <summary>
+    /// Owns the global <see cref="GameState"/>. Validates transitions against
+    /// <see cref="GameStateTransitions"/> and announces changes on the event bus.
+    /// Deliberately has NO engine side effects (time scale, audio, ...): those are reactions that
+    /// live in <see cref="PlatformStatePolicy"/>, which keeps this class unit-testable.
+    /// </summary>
+    public sealed class GameStateManager : IGameStateService, IGameService
+    {
+        private readonly IEventBus _eventBus;
+
+        public GameStateManager(IEventBus eventBus)
+        {
+            _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
+        }
+
+        public GameState Current { get; private set; } = GameState.Boot;
+
+        public GameState Previous { get; private set; } = GameState.Boot;
+
+        public void Initialize()
+        {
+            Current = GameState.Boot;
+            Previous = GameState.Boot;
+        }
+
+        public void Shutdown()
+        {
+        }
+
+        public bool TryChangeState(GameState next)
+        {
+            if (!GameStateTransitions.IsAllowed(Current, next))
+            {
+                GameLog.Warning($"Rejected illegal game state transition {Current} -> {next}.");
+                return false;
+            }
+
+            Previous = Current;
+            Current = next;
+            GameLog.Info($"Game state: {Previous} -> {Current}");
+            _eventBus.Publish(new GameStateChangedEvent(Previous, Current));
+            return true;
+        }
+    }
+}
+
+// ====================================================================
+// Managers/SceneService
+// ====================================================================
+namespace ProjectUnknown.Managers
+{
+    /// <summary>
+    /// Asynchronous single-scene loader with progress events (for loading screens).
+    /// Runs its coroutine on the persistent GameRoot so it survives the scene change.
+    /// </summary>
+    public sealed class SceneService : ISceneService, IGameService
+    {
+        // Unity reports 0..0.9 while loading; 0.9 means "ready", the rest is activation.
+        private const float ProgressReadyThreshold = 0.9f;
+
+        private readonly IEventBus _eventBus;
+        private readonly MonoBehaviour _runner;
+
+        public SceneService(IEventBus eventBus, MonoBehaviour runner)
+        {
+            _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
+            _runner = runner != null ? runner : throw new ArgumentNullException(nameof(runner));
+        }
+
+        public bool IsLoading { get; private set; }
+
+        public void Initialize()
+        {
+            IsLoading = false;
+        }
+
+        public void Shutdown()
+        {
+            IsLoading = false;
+        }
+
+        public bool LoadScene(string sceneName)
+        {
+            if (string.IsNullOrWhiteSpace(sceneName))
+            {
+                GameLog.Error("LoadScene called with an empty scene name.");
+                return false;
+            }
+
+            if (IsLoading)
+            {
+                GameLog.Warning($"LoadScene('{sceneName}') ignored: another scene is already loading.");
+                return false;
+            }
+
+            if (!Application.CanStreamedLevelBeLoaded(sceneName))
+            {
+                GameLog.Error($"Scene '{sceneName}' cannot be loaded. Is it added to File > Build Profiles > Scene List?");
+                return false;
+            }
+
+            IsLoading = true;
+            _runner.StartCoroutine(LoadRoutine(sceneName));
+            return true;
+        }
+
+        private IEnumerator LoadRoutine(string sceneName)
+        {
+            _eventBus.Publish(new SceneLoadStartedEvent(sceneName));
+
+            AsyncOperation operation = SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Single);
+            if (operation == null)
+            {
+                IsLoading = false;
+                GameLog.Error($"SceneManager.LoadSceneAsync('{sceneName}') returned null.");
+                yield break;
+            }
+
+            while (!operation.isDone)
+            {
+                float normalised = Mathf.Clamp01(operation.progress / ProgressReadyThreshold);
+                _eventBus.Publish(new SceneLoadProgressEvent(sceneName, normalised));
+                yield return null;
+            }
+
+            IsLoading = false;
+            _eventBus.Publish(new SceneLoadCompletedEvent(sceneName));
+        }
+    }
+}
+
+// ====================================================================
+// Managers/QualityManager
+// ====================================================================
+namespace ProjectUnknown.Managers
+{
+    /// <summary>
+    /// Applies and persists the graphics preset. First launch: pick a preset from the device specs.
+    /// Later launches: restore the player's choice (PlayerPrefs is fine for a single settings int;
+    /// real game saves go through the Phase 6 save system, never PlayerPrefs).
+    /// Phase 1 applies the engine-level knobs only; URP asset switching arrives in Phase 7.
+    /// </summary>
+    public sealed class QualityManager : IQualityService, IGameService
+    {
+        private const string PrefKey = "pu.settings.graphicsQuality";
+
+        private readonly IEventBus _eventBus;
+
+        public QualityManager(IEventBus eventBus)
+        {
+            _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
+        }
+
+        public GraphicsQuality Current { get; private set; } = GraphicsQuality.Low;
+
+        public void Initialize()
+        {
+            GraphicsQuality quality;
+            if (!TryLoadSaved(out quality))
+            {
+                quality = QualityProfiles.Recommend(SystemInfo.systemMemorySize, SystemInfo.processorCount);
+                GameLog.Info($"First launch: recommended quality {quality} " +
+                             $"(RAM {SystemInfo.systemMemorySize} MB, {SystemInfo.processorCount} cores).");
+            }
+
+            Apply(quality, false);
+        }
+
+        public void Shutdown()
+        {
+        }
+
+        public void SetQuality(GraphicsQuality quality)
+        {
+            if (!Enum.IsDefined(typeof(GraphicsQuality), quality))
+            {
+                GameLog.Warning($"SetQuality ignored: {(int)quality} is not a valid GraphicsQuality.");
+                return;
+            }
+
+            if (quality == Current)
+            {
+                return;
+            }
+
+            Apply(quality, true);
+        }
+
+        private static bool TryLoadSaved(out GraphicsQuality quality)
+        {
+            quality = GraphicsQuality.Low;
+            if (!PlayerPrefs.HasKey(PrefKey))
+            {
+                return false;
+            }
+
+            int raw = PlayerPrefs.GetInt(PrefKey, -1);
+            if (!Enum.IsDefined(typeof(GraphicsQuality), raw))
+            {
+                return false; // corrupted / from a future version: fall back to auto-detect
+            }
+
+            quality = (GraphicsQuality)raw;
+            return true;
+        }
+
+        private void Apply(GraphicsQuality quality, bool persist)
+        {
+            QualityProfile profile = QualityProfiles.For(quality);
+
+            QualitySettings.vSyncCount = 0; // frame rate is driven by targetFrameRate on mobile
+            Application.targetFrameRate = profile.TargetFrameRate;
+            QualitySettings.lodBias = profile.LodBias;
+            QualitySettings.globalTextureMipmapLimit = profile.TextureMipmapLimit;
+            QualitySettings.anisotropicFiltering = profile.UseAnisotropicFiltering
+                ? AnisotropicFiltering.ForceEnable
+                : AnisotropicFiltering.Disable;
+
+            GraphicsQuality previous = Current;
+            Current = quality;
+
+            if (persist)
+            {
+                PlayerPrefs.SetInt(PrefKey, (int)quality);
+                PlayerPrefs.Save();
+            }
+
+            GameLog.Info($"Graphics quality applied: {quality} ({profile.TargetFrameRate} fps target).");
+            _eventBus.Publish(new QualityChangedEvent(previous, quality));
+        }
+    }
+}
+
+// ====================================================================
+// Managers/PlatformStatePolicy
+// ====================================================================
+namespace ProjectUnknown.Managers
+{
+    /// <summary>
+    /// Translates game state into engine/platform behaviour in ONE place:
+    ///  - Paused  -> time scale 0 and audio paused
+    ///  - Playing/Loading -> screen stays awake; every other state lets the OS sleep the screen (battery)
+    /// </summary>
+    public sealed class PlatformStatePolicy : IGameService
+    {
+        private readonly IEventBus _eventBus;
+
+        public PlatformStatePolicy(IEventBus eventBus)
+        {
+            _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
+        }
+
+        public void Initialize()
+        {
+            _eventBus.Subscribe<GameStateChangedEvent>(OnGameStateChanged);
+            Apply(GameState.Boot);
+        }
+
+        public void Shutdown()
+        {
+            _eventBus.Unsubscribe<GameStateChangedEvent>(OnGameStateChanged);
+            Time.timeScale = 1f;
+            AudioListener.pause = false;
+            Screen.sleepTimeout = SleepTimeout.SystemSetting;
+        }
+
+        private void OnGameStateChanged(GameStateChangedEvent evt)
+        {
+            Apply(evt.Current);
+        }
+
+        private static void Apply(GameState state)
+        {
+            bool paused = state == GameState.Paused;
+            Time.timeScale = paused ? 0f : 1f;
+            AudioListener.pause = paused;
+
+            bool keepAwake = state == GameState.Playing || state == GameState.Loading;
+            Screen.sleepTimeout = keepAwake ? SleepTimeout.NeverSleep : SleepTimeout.SystemSetting;
+        }
+    }
+}
+
+// ====================================================================
+// Managers/GameRoot
+// ====================================================================
+namespace ProjectUnknown.Managers
+{
+    /// <summary>
+    /// Composition root. The ONLY place that knows concrete service types.
+    /// It is created automatically before the first scene loads (no Boot scene or manual setup
+    /// needed, so any scene can be pressed Play in the Editor) and persists for the whole session.
+    /// Services are registered against their Core interfaces; consumers never see this class.
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class GameRoot : MonoBehaviour
+    {
+        private static GameRoot _instance;
+
+        private readonly List<IGameService> _services = new List<IGameService>(4);
+        private EventBus _eventBus;
+        private IGameStateService _gameState;
+
+        // Runs before BeforeSceneLoad. Needed when "Enter Play Mode > Reload Domain" is disabled,
+        // because statics would otherwise survive from the previous play session.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetStatics()
+        {
+            _instance = null;
+            ServiceLocator.Clear();
+        }
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        private static void AutoCreate()
+        {
+            if (_instance != null)
+            {
+                return;
+            }
+
+            var root = new GameObject("[ProjectUnknown] GameRoot");
+            root.AddComponent<GameRoot>();
+        }
+
+        private void Awake()
+        {
+            if (_instance != null && _instance != this)
+            {
+                Destroy(gameObject); // a second GameRoot (e.g. placed manually in a scene) is redundant
+                return;
+            }
+
+            _instance = this;
+            DontDestroyOnLoad(gameObject);
+            ComposeServices();
+        }
+
+        private void OnApplicationPause(bool pauseStatus)
+        {
+            if (_instance != this || _eventBus == null)
+            {
+                return;
+            }
+
+            // Publish first so listeners (the future save system) can persist before anything else happens.
+            _eventBus.Publish(new ApplicationPausedEvent(pauseStatus));
+
+            // Backgrounded mid-game: put the game into Paused. We never auto-resume; the player taps Resume.
+            if (pauseStatus && _gameState != null && _gameState.Current == GameState.Playing)
+            {
+                _gameState.TryChangeState(GameState.Paused);
+            }
+        }
+
+        private void OnApplicationQuit()
+        {
+            // Best effort only: Android may kill the process without calling this.
+            if (_instance == this && _eventBus != null)
+            {
+                _eventBus.Publish(new ApplicationQuittingEvent());
+            }
+        }
+
+        private void OnDestroy()
+        {
+            if (_instance != this)
+            {
+                return; // the discarded duplicate must not tear down the real services
+            }
+
+            for (int i = _services.Count - 1; i >= 0; i--)
+            {
+                try
+                {
+                    _services[i].Shutdown();
+                }
+                catch (Exception ex)
+                {
+                    GameLog.Error($"Shutdown of {_services[i].GetType().Name} failed: {ex}");
+                }
+            }
+
+            _services.Clear();
+            _eventBus?.Clear();
+            ServiceLocator.Clear();
+            _instance = null;
+        }
+
+        private void ComposeServices()
+        {
+            _eventBus = new EventBus();
+            ServiceLocator.Register<IEventBus>(_eventBus);
+
+            var gameState = new GameStateManager(_eventBus);
+            ServiceLocator.Register<IGameStateService>(gameState);
+            _gameState = gameState;
+            _services.Add(gameState);
+
+            var scenes = new SceneService(_eventBus, this);
+            ServiceLocator.Register<ISceneService>(scenes);
+            _services.Add(scenes);
+
+            var quality = new QualityManager(_eventBus);
+            ServiceLocator.Register<IQualityService>(quality);
+            _services.Add(quality);
+
+            // Internal reaction layer, not exposed through the locator.
+            _services.Add(new PlatformStatePolicy(_eventBus));
+
+            for (int i = 0; i < _services.Count; i++)
+            {
+                try
+                {
+                    _services[i].Initialize();
+                }
+                catch (Exception ex)
+                {
+                    GameLog.Error($"Initialize of {_services[i].GetType().Name} failed: {ex}");
+                }
+            }
+
+            GameLog.Info($"GameRoot ready: {_services.Count} services initialised.");
+        }
+    }
+}
